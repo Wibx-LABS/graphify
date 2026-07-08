@@ -2933,6 +2933,32 @@ def _swift_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: s
     return False
 
 
+# ── Java extra walk for enum constants ───────────────────────────────────────
+
+def _java_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: str,
+                     nodes: list, edges: list, seen_ids: set, function_bodies: list,
+                     parent_class_nid: str | None, add_node_fn, add_edge_fn,
+                     walk_fn) -> bool:
+    """Handle enum_constant for Java. Returns True if handled."""
+    if node.type == "enum_constant" and parent_class_nid:
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return True
+        const_name = _read_text(name_node, source)
+        line = node.start_point[0] + 1
+        const_nid = _make_id(parent_class_nid, const_name)
+        add_node_fn(const_nid, const_name, line)
+        add_edge_fn(parent_class_nid, const_nid, "case_of", line)
+        # Anonymous-body constants (`MONDAY { void greet(){} }`): descend so the
+        # body's methods aren't dropped; const_nid attaches them to the constant.
+        for child in node.children:
+            if child.type == "class_body":
+                for member in child.children:
+                    walk_fn(member, parent_class_nid=const_nid)
+        return True
+    return False
+
+
 # ── Language configs ──────────────────────────────────────────────────────────
 
 _PYTHON_CONFIG = LanguageConfig(
@@ -3424,10 +3450,16 @@ def _ruby_extra_walk(node, source: bytes, file_nid: str, stem: str, str_path: st
                         if base_nid not in seen_ids:
                             base_nid = _make_id(base)
                             if base_nid not in seen_ids:
+                                # origin_file lets _disambiguate_colliding_node_ids
+                                # tell this file's unresolved reference apart from
+                                # another file's same-named one, instead of every
+                                # file's stub collapsing onto one shared bare id
+                                # (see ensure_named_node(), which sets the same
+                                # field for this exact reason).
                                 nodes.append({
                                     "id": base_nid, "label": base,
                                     "file_type": "code", "source_file": "",
-                                    "source_location": "",
+                                    "source_location": "", "origin_file": str_path,
                                 })
                                 seen_ids.add(base_nid)
                         add_edge(class_nid, base_nid, "inherits", line)
@@ -3681,18 +3713,7 @@ def _extract_generic(
                     for arg in args.children:
                         if arg.type == "identifier":
                             base = _read_text(arg, source)
-                            base_nid = _make_id(stem, base)
-                            if base_nid not in seen_ids:
-                                base_nid = _make_id(base)
-                                if base_nid not in seen_ids:
-                                    nodes.append({
-                                        "id": base_nid,
-                                        "label": base,
-                                        "file_type": "code",
-                                        "source_file": "",
-                                        "source_location": "",
-                                    })
-                                    seen_ids.add(base_nid)
+                            base_nid = ensure_named_node(base, line)
                             add_edge(class_nid, base_nid, "inherits", line)
 
             # Swift-specific: conformance / inheritance
@@ -3831,18 +3852,7 @@ def _extract_generic(
                         base = _kotlin_user_type_name(user_type_node, source)
                         if not base:
                             continue
-                        base_nid = _make_id(stem, base)
-                        if base_nid not in seen_ids:
-                            base_nid = _make_id(base)
-                            if base_nid not in seen_ids:
-                                nodes.append({
-                                    "id": base_nid,
-                                    "label": base,
-                                    "file_type": "code",
-                                    "source_file": "",
-                                    "source_location": "",
-                                })
-                                seen_ids.add(base_nid)
+                        base_nid = ensure_named_node(base, line)
                         add_edge(class_nid, base_nid, relation, line)
                         for arg_child in user_type_node.children:
                             if arg_child.type != "type_arguments":
@@ -3876,18 +3886,7 @@ def _extract_generic(
                                 base = _read_text(consts[-1], source)
                             break
                     if base:
-                        base_nid = _make_id(stem, base)
-                        if base_nid not in seen_ids:
-                            base_nid = _make_id(base)
-                            if base_nid not in seen_ids:
-                                nodes.append({
-                                    "id": base_nid,
-                                    "label": base,
-                                    "file_type": "code",
-                                    "source_file": "",
-                                    "source_location": "",
-                                })
-                                seen_ids.add(base_nid)
+                        base_nid = ensure_named_node(base, line)
                         add_edge(class_nid, base_nid, "inherits", line)
 
                 # `include`/`extend`/`prepend <Const>` in the class/module body ->
@@ -4153,18 +4152,7 @@ def _extract_generic(
                             continue
                         if not base:
                             continue
-                        base_nid = _make_id(stem, base)
-                        if base_nid not in seen_ids:
-                            base_nid = _make_id(base)
-                            if base_nid not in seen_ids:
-                                nodes.append({
-                                    "id": base_nid,
-                                    "label": base,
-                                    "file_type": "code",
-                                    "source_file": "",
-                                    "source_location": "",
-                                })
-                                seen_ids.add(base_nid)
+                        base_nid = ensure_named_node(base, line)
                         add_edge(class_nid, base_nid, "inherits", line)
                         # Emit a generic_arg reference for each type argument on the
                         # base (Base<Dep> -> Car references Dep). _cpp_collect_type_refs
@@ -4853,6 +4841,12 @@ def _extract_generic(
                                   nodes, edges, seen_ids, function_bodies,
                                   parent_class_nid, add_node, add_edge,
                                   ensure_named_node):
+                return
+
+        if config.ts_module == "tree_sitter_java":
+            if _java_extra_walk(node, source, file_nid, stem, str_path,
+                                nodes, edges, seen_ids, function_bodies,
+                                parent_class_nid, add_node, add_edge, walk):
                 return
 
         if config.ts_module == "tree_sitter_ruby":
@@ -9828,6 +9822,52 @@ def _lang_is_case_insensitive(source_file: object) -> bool:
     return Path(str(source_file)).suffix.lower() in _CASE_INSENSITIVE_EXTS
 
 
+# Language interop families for cross-file call resolution. A call in one language
+# can never bind by name to a definition in another family — a TSX component does
+# not invoke a Kotlin method, and a Python function does not invoke a Java one.
+# Families are grouped by REAL interop so legitimate cross-language resolution
+# keeps working: Kotlin/Java/Scala/Groovy share the JVM, C/C++/Objective-C/CUDA
+# share headers and symbols (Swift bridges to Objective-C), and JS/TS variants
+# (plus Vue/Svelte/Astro SFC script blocks) compile into one module graph.
+# Extensions absent from this map (docs, configs, unknown languages) resolve to
+# no family and are never filtered — same permissive default as before.
+_LANG_FAMILY_BY_EXT: dict[str, str] = {
+    # JS/TS module graph (SFCs embed JS/TS)
+    ".js": "jsts", ".jsx": "jsts", ".mjs": "jsts", ".cjs": "jsts",
+    ".ts": "jsts", ".tsx": "jsts", ".mts": "jsts", ".cts": "jsts",
+    ".vue": "jsts", ".svelte": "jsts", ".astro": "jsts",
+    # JVM interop
+    ".java": "jvm", ".kt": "jvm", ".kts": "jvm",
+    ".scala": "jvm", ".groovy": "jvm", ".gradle": "jvm",
+    # C-family: shared headers, Objective-C/C++ mix, Swift↔ObjC bridging
+    ".c": "native", ".h": "native", ".cpp": "native", ".cc": "native",
+    ".cxx": "native", ".hpp": "native", ".cu": "native", ".cuh": "native",
+    ".metal": "native", ".m": "native", ".mm": "native", ".swift": "native",
+    # Single-language families
+    ".py": "python",
+    ".go": "go",
+    ".rs": "rust",
+    ".rb": "ruby",
+    ".php": "php", ".phtml": "php", ".php3": "php", ".php4": "php",
+    ".php5": "php", ".php7": "php", ".phps": "php",
+    ".cs": "dotnet", ".razor": "dotnet", ".cshtml": "dotnet", ".xaml": "dotnet",
+    ".lua": "lua", ".luau": "lua",
+    ".zig": "zig",
+    ".ex": "elixir", ".exs": "elixir",
+    ".jl": "julia",
+    ".dart": "dart",
+    ".sh": "shell", ".bash": "shell",
+    ".ps1": "powershell", ".psm1": "powershell", ".psd1": "powershell",
+}
+
+
+def _lang_family(source_file: object) -> str | None:
+    """Interop family of the file's language, or None when unknown/not code."""
+    if not source_file:
+        return None
+    return _LANG_FAMILY_BY_EXT.get(Path(str(source_file)).suffix.lower())
+
+
 def _node_label_key(node: dict, fold: bool = False) -> str:
     label = str(node.get("label", "")).strip()
     key = re.sub(r"[^a-zA-Z0-9]+", "", label)
@@ -11985,6 +12025,13 @@ def _resolve_typescript_member_calls(
         else:
             type_name = type_table_by_file.get(rc.get("source_file", ""), {}).get(receiver)
         if not type_name:
+            continue
+        # A builtin global receiver type (Date, Promise, Map, ...) must not resolve
+        # to a user symbol. _key() casefolds, so `x: Date; x.getTime()` would bind
+        # the caller to a same-named user `class DATE` in another file, inventing
+        # phantom `references[call]` edges and a false god node (#1726). The
+        # cross-file CALL resolver already skips these globals; do the same here.
+        if type_name in _LANGUAGE_BUILTIN_GLOBALS:
             continue
         type_defs = type_def_nids.get(_key(type_name), [])
         if len(type_defs) != 1:
@@ -16748,6 +16795,23 @@ def extract(
             candidates = global_label_to_nids_ci.get(callee.lower(), [])
         if not candidates:
             continue
+        # Cross-language guard: never bind a call to a definition in a different
+        # language family. Name-only matching was resolving a TSX callback passed
+        # by name to a same-named Kotlin method in the Android half of the repo
+        # (and a Python call to a Kotlin fun) — phantom edges the extraction spec
+        # explicitly forbids. Candidates whose family is unknown (no source_file,
+        # non-code nodes) are kept, preserving the previous permissive behavior;
+        # real interop pairs (Kotlin↔Java, C↔C++↔ObjC, JS↔TS) share a family and
+        # still resolve.
+        caller_family = _lang_family(rc.get("source_file"))
+        if caller_family is not None:
+            candidates = [
+                c for c in candidates
+                if (candidate_family := _lang_family(nid_to_source_file.get(c))) is None
+                or candidate_family == caller_family
+            ]
+            if not candidates:
+                continue
         caller = rc["caller_nid"]
         # Resolve the caller's file via the raw_call's own source_file string,
         # which is stable regardless of any caller_nid remap. An indirect
