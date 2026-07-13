@@ -1778,7 +1778,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".py": "python",
     ".go": "go",
     ".rs": "rust",
-    ".rb": "ruby",
+    ".rb": "ruby", ".rake": "ruby",
     ".php": "php", ".phtml": "php", ".php3": "php", ".php4": "php",
     ".php5": "php", ".php7": "php", ".phps": "php",
     ".cs": "dotnet", ".razor": "dotnet", ".cshtml": "dotnet", ".xaml": "dotnet",
@@ -1805,10 +1805,27 @@ def _node_label_key(node: dict, fold: bool = False) -> str:
     return key.lower() if fold else key
 
 
+def _is_top_level_function_definition(node: dict) -> bool:
+    """A free/top-level function def (label ``name()``), not a method or type.
+
+    Methods carry a leading dot (``.foo()``) or a qualifier (``Class.foo()``);
+    excluding those keeps a bare-name reference from binding to a receiver-scoped
+    method, which the receiver-typed resolvers own (#1781).
+    """
+    label = str(node.get("label", "")).strip()
+    return (
+        node.get("file_type") == "code"
+        and label.endswith(")")
+        and not label.startswith(".")
+        and "." not in label
+    )
+
+
 def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
     """Map unresolved no-source stubs to a unique real definition with the same label."""
-    real_by_label: dict[str, list[dict]] = {}       # exact-case (all languages)
+    real_by_label: dict[str, list[dict]] = {}       # exact-case type-like (all languages)
     real_by_label_ci: dict[str, list[dict]] = {}    # case-INSENSITIVE-language reals only
+    func_by_label: dict[str, list[dict]] = {}       # top-level function defs (#1781)
     stubs: list[dict] = []
 
     for node in nodes:
@@ -1824,8 +1841,33 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
                 if _lang_is_case_insensitive(node.get("source_file")):
                     real_by_label_ci.setdefault(
                         _node_label_key(node, fold=True), []).append(node)
+            elif _is_top_level_function_definition(node):
+                func_by_label.setdefault(key, []).append(node)
             continue
         stubs.append(node)
+
+    # Language families referencing each stub, for the function-merge guard (#1781):
+    # a cross-module `references` edge to a function used to dangle on a sourceless
+    # name-only stub because functions were excluded as rewire targets. We now allow
+    # a UNIQUE function definition to absorb it, but only when it shares a language
+    # family with the stub's referrers — so a Python `get_db` reference can't bind to
+    # a unique Go `get_db()` (mirrors the #1718/#1749 interop guard).
+    stub_ids = {str(s.get("id")) for s in stubs if s.get("id")}
+    stub_families: dict[str, set] = {}
+    supertype_stub_ids: set[str] = set()  # stubs used as a base type — never a function
+    _SUPERTYPE_RELATIONS = {"inherits", "implements", "extends"}
+    for edge in edges:
+        rel = edge.get("relation")
+        for endpoint in ("source", "target"):
+            nid = edge.get(endpoint)
+            if nid in stub_ids:
+                fam = _lang_family(edge.get("source_file"))
+                if fam is not None:
+                    stub_families.setdefault(str(nid), set()).add(fam)
+                # A stub referenced as a supertype must resolve to a class/type,
+                # not a same-named function (you don't inherit from a function).
+                if endpoint == "target" and rel in _SUPERTYPE_RELATIONS:
+                    supertype_stub_ids.add(str(nid))
 
     remap: dict[str, str] = {}
     for stub in stubs:
@@ -1834,12 +1876,22 @@ def _rewire_unique_stub_nodes(nodes: list[dict], edges: list[dict]) -> None:
             continue
         candidates = real_by_label.get(_node_label_key(stub), [])
         if len(candidates) != 1:
-            # No unique exact match — fall back to a case-insensitive match, but
+            # No unique exact type match — fall back to a case-insensitive match, but
             # only against case-insensitive-language definitions (so a case-sensitive
             # `PATH` can never absorb a `Path` reference).
             candidates = real_by_label_ci.get(_node_label_key(stub, fold=True), [])
-            if len(candidates) != 1:
-                continue
+        if len(candidates) != 1:
+            # #1781: no unique type — try a unique top-level FUNCTION definition,
+            # gated by (a) the stub not being used as a supertype and (b) a
+            # language-family match with the stub's referrers.
+            fcands = func_by_label.get(_node_label_key(stub), [])
+            if len(fcands) == 1 and stub_id not in supertype_stub_ids:
+                fams = stub_families.get(stub_id, set())
+                cand_fam = _lang_family(fcands[0].get("source_file"))
+                if not fams or cand_fam is None or cand_fam in fams:
+                    candidates = fcands
+        if len(candidates) != 1:
+            continue
         target_id = candidates[0].get("id")
         if isinstance(target_id, str) and target_id and target_id != stub_id:
             remap[stub_id] = target_id
@@ -2705,7 +2757,7 @@ register_language_resolver(
 # Ruby type-aware member-call resolution (Class.new + typed var.method). Lives in
 # graphify.ruby_resolution; registered here as a second consumer of the framework.
 register_language_resolver(
-    LanguageResolver("ruby_member_calls", frozenset({".rb"}), resolve_ruby_member_calls)
+    LanguageResolver("ruby_member_calls", frozenset({".rb", ".rake"}), resolve_ruby_member_calls)
 )
 register_language_resolver(
     LanguageResolver("typescript_member_calls", frozenset({".ts", ".tsx", ".mts", ".cts", ".js", ".jsx"}), _resolve_typescript_member_calls)
@@ -3761,7 +3813,7 @@ _DISPATCH: dict[str, Any] = {
     ".cu": extract_cpp,
     ".cuh": extract_cpp,
     ".metal": extract_cpp,
-    ".rb": extract_ruby,
+    ".rb": extract_ruby, ".rake": extract_ruby,
     ".cs": extract_csharp,
     ".kt": extract_kotlin,
     ".kts": extract_kotlin,
@@ -4008,20 +4060,28 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     ProcessPoolExecutor.
 
     Args:
-        args: (index, path_str, cache_root_str) tuple
+        args: (index, path_str, root_str, cache_location_str) tuple. ``root``
+            anchors hash keys / node ids / the XAML boundary; ``cache_location``
+            is where the cache dir is written, decoupled per #1774. A legacy
+            3-tuple (no cache_location) is still accepted for back-compat.
 
     Returns:
         (index, result_dict) so results can be placed back in order.
     """
-    idx, path_str, cache_root_str = args
+    if len(args) == 4:
+        idx, path_str, root_str, cache_location_str = args
+    else:  # legacy 3-tuple: location == anchor
+        idx, path_str, root_str = args
+        cache_location_str = root_str
     path = Path(path_str)
-    cache_root = Path(cache_root_str)
+    root = Path(root_str)
+    cache_location = Path(cache_location_str)
     _raise_recursion_limit()
     bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
 
     # Check cache first (avoid re-extraction)
     if not bypass_cache:
-        cached = load_cached(path, cache_root)
+        cached = load_cached(path, root, cache_root=cache_location)
         if cached is not None:
             return idx, cached
 
@@ -4029,23 +4089,24 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     if extractor is None:
         return idx, {"nodes": [], "edges": []}
 
-    result = _safe_extract_with_xaml_root(extractor, path, cache_root)
+    result = _safe_extract_with_xaml_root(extractor, path, root)
     # Never cache a zero-node result for an extractable file. Every supported
     # source produces at least a file node, so an empty node list is anomalous
     # (e.g. a transient batch/parallel hiccup). Caching it makes the empty
     # byte-stable across runs and silently blinds affected/explain to and
     # through the file (#1666); skipping the write lets a rerun self-heal.
     if not bypass_cache and "error" not in result and result.get("nodes"):
-        save_cached(path, result, cache_root)
+        save_cached(path, result, root, cache_root=cache_location)
     return idx, result
 
 
 def _extract_parallel(
     uncached_work: list[tuple[int, Path]],
     per_file: list[dict | None],
-    effective_root: Path,
+    root: Path,
     max_workers: int | None,
     total_files: int,
+    cache_location: Path | None = None,
 ) -> bool:
     """Extract uncached files in parallel using ProcessPoolExecutor.
 
@@ -4082,8 +4143,11 @@ def _extract_parallel(
         max_workers = min(max_workers, 61)
     max_workers = max(max_workers, 1)
 
-    root_str = str(effective_root)
-    work_items = [(idx, str(path), root_str) for idx, path in uncached_work]
+    # root anchors hash keys / node ids / XAML boundary; cache_location is where
+    # the cache dir is written (defaults to root when not decoupled) (#1774).
+    root_str = str(root)
+    cache_loc_str = str(cache_location if cache_location is not None else root)
+    work_items = [(idx, str(path), root_str, cache_loc_str) for idx, path in uncached_work]
 
     done_count = 0
     _PROGRESS_INTERVAL = 100
@@ -4143,8 +4207,9 @@ def _extract_parallel(
 def _extract_sequential(
     uncached_work: list[tuple[int, Path]],
     per_file: list[dict | None],
-    effective_root: Path,
+    root: Path,
     total_files: int,
+    cache_location: Path | None = None,
 ) -> None:
     """Extract uncached files sequentially (fallback for small batches)."""
     _PROGRESS_INTERVAL = 100
@@ -4163,10 +4228,11 @@ def _extract_sequential(
             per_file[idx] = {"nodes": [], "edges": []}
             continue
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
-        result = _safe_extract_with_xaml_root(extractor, path, effective_root)
+        # XAML boundary anchors on `root` (the corpus), not the cache location.
+        result = _safe_extract_with_xaml_root(extractor, path, root)
         # See _extract_single_file: don't cache an anomalous zero-node result (#1666).
         if not bypass_cache and "error" not in result and result.get("nodes"):
-            save_cached(path, result, effective_root)
+            save_cached(path, result, root, cache_root=cache_location)
         per_file[idx] = result
     if total_files >= _PROGRESS_INTERVAL:
         # Consistent denominator with the intermediate lines (#1693).
@@ -4229,7 +4295,13 @@ def extract(
         root = cache_root
     root = root.resolve()
 
-    effective_root = cache_root or root
+    # #1774: the cache is an OUTPUT, so when no explicit cache_root is given it is
+    # written under the current working directory — never `root` (the inferred
+    # common parent of the inputs), which would drop graphify-out/ inside a
+    # read-only or foreign corpus. `root` still anchors the content-hash keys,
+    # node ids, symbol resolution, and the XAML project-scan boundary; only the
+    # cache directory's location diverges from it.
+    cache_location = (cache_root if cache_root is not None else Path(".")).resolve()
     total = len(paths)
 
     # Phase 1: separate cached hits from uncached work
@@ -4242,7 +4314,7 @@ def extract(
             continue
         bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
         if not bypass_cache:
-            cached = load_cached(path, effective_root)
+            cached = load_cached(path, root, cache_root=cache_location)
             if cached is not None:
                 per_file[i] = cached
                 continue
@@ -4253,10 +4325,10 @@ def extract(
         ran_parallel = False
         if parallel and len(uncached_work) >= _PARALLEL_THRESHOLD:
             ran_parallel = _extract_parallel(
-                uncached_work, per_file, effective_root, max_workers, total
+                uncached_work, per_file, root, max_workers, total, cache_location
             )
         if not ran_parallel:
-            _extract_sequential(uncached_work, per_file, effective_root, total)
+            _extract_sequential(uncached_work, per_file, root, total, cache_location)
 
     # Fill any remaining None slots (shouldn't happen, but defensive)
     for i in range(total):
